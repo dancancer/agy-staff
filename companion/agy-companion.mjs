@@ -96,6 +96,7 @@ import { randomUUID } from 'node:crypto';
 import { boundSnapshot, excerpt, createNativeErrorCollector, nativeResult, hasNativeWarnings } from './observation.mjs';
 import { atomicJSON, runStreaming, processIdentity } from './stream-worker.mjs';
 import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
+import { StateStore, sqliteCtor, STATE_DB_FILENAME, STATE_BACKUP_FILENAME } from './state-db.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const TEMPLATES_DIR = path.join(path.dirname(SELF), '..', 'templates');
@@ -428,7 +429,26 @@ function ensureStateDir() {
   return dir;
 }
 
-function loadState() {
+function storePath() {
+  return path.join(stateDir(), STATE_DB_FILENAME);
+}
+
+// Cached database handle. Opened lazily on first access once state.sqlite
+// exists; readers never create it, so pure `status`/`wait`/`observe` runs do
+// not turn a JSON-state repository into a SQLite one behind the user's back.
+let stateStore = null;
+
+/** Escape hatch for old Node runtimes without `node:sqlite` and for
+ *  debugging: keep state.json as the only store, never migrate. */
+function stateJsonOnly() {
+  return process.env.AGY_STAFF_LEGACY_JSON === '1';
+}
+
+function storeReady() {
+  return !stateJsonOnly() && fs.existsSync(storePath());
+}
+
+function readJsonState() {
   let raw;
   try {
     raw = readTextRetry(statePath());
@@ -447,8 +467,19 @@ function loadState() {
   }
 }
 
-function saveState(state) {
-  ensureStateDir();
+function loadState() {
+  if (!storeReady()) return readJsonState();
+  try {
+    stateStore ||= new StateStore(storePath());
+    return stateStore.loadState();
+  } catch (error) {
+    // Same doctrine as the JSON path: never mistake an unreadable store for
+    // "no state" — the next save would wipe every job record.
+    die(`cannot read state database ${storePath()}: ${error.message} — repair it or move it aside (state.json keeps the latest exported snapshot), then retry`);
+  }
+}
+
+function writeStateJson(state) {
   // Atomic replace: a detached worker and a status/result call can read this
   // file at any moment; a plain truncate-then-write leaves a torn window.
   const tmp = statePath() + `.tmp-${process.pid}`;
@@ -456,9 +487,67 @@ function saveState(state) {
   replaceFile(tmp, statePath());
 }
 
+function saveState(state) {
+  ensureStateDir();
+  if (storeReady()) {
+    try {
+      stateStore ||= new StateStore(storePath());
+      stateStore.saveState(state);
+    } catch (error) {
+      die(`cannot write state database ${storePath()}: ${error.message}`);
+    }
+  }
+  // state.json doubles as the legacy store (while no database exists) and as
+  // the one-way exported snapshot for external readers (DSH sidebar, older
+  // companion builds, humans). The companion itself reads it only when the
+  // database is absent, so there is no diverging second source of truth.
+  writeStateJson(state);
+}
+
+/** Import an existing state.json into state.sqlite once, on the first write.
+ *  Runs inside the state lock, so a concurrent older writer cannot slip a
+ *  read-modify-write between the import and the original being set aside. */
+function migrateStateToStore() {
+  if (stateJsonOnly() || fs.existsSync(storePath())) return;
+  if (!sqliteCtor()) return; // Node without node:sqlite keeps the JSON path
+  const imported = readJsonState(); // dies on a corrupt file; missing → empty
+  const initPath = `${storePath()}.init-${process.pid}`;
+  try {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(initPath + suffix, { force: true });
+    const boot = new StateStore(initPath);
+    boot.importState(imported);
+    boot.integrityCheck();
+    boot.close();
+    fs.renameSync(initPath, storePath());
+  } catch (error) {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(initPath + suffix, { force: true });
+    die(`state migration to ${STATE_DB_FILENAME} failed: ${error.message}`);
+  }
+  // Keep the original file as a migration backup (never delete it). The next
+  // saveState republishes state.json as the fresh exported snapshot.
+  const legacy = statePath();
+  if (fs.existsSync(legacy)) {
+    let backup = path.join(stateDir(), STATE_BACKUP_FILENAME);
+    if (fs.existsSync(backup)) {
+      backup = path.join(stateDir(), `${STATE_BACKUP_FILENAME}.${new Date().toISOString().slice(0, 19).replaceAll(':', '-')}`);
+    }
+    try { fs.renameSync(legacy, backup); } catch {}
+  }
+  // Republish the exported snapshot immediately: a command whose change()
+  // dies before saveState() must not leave external readers without
+  // state.json while the migrated database already owns the truth.
+  writeStateJson(imported);
+  try {
+    stateStore = new StateStore(storePath());
+  } catch (error) {
+    die(`cannot open migrated state database ${storePath()}: ${error.message}`);
+  }
+}
+
 function updateState(change) {
   ensureStateDir();
   return withStateLock(statePath() + '.lock', () => {
+    migrateStateToStore();
     const state = loadState();
     const value = change(state);
     saveState(state);

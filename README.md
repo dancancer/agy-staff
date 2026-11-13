@@ -189,6 +189,8 @@ The timeline below follows a background task from delegation to completion. The 
 
 Jobs have a separate execution deadline: default 60 minutes, configurable at launch with `--timeout` up to 120 minutes. Use `cancel` to stop execution, or explicitly request `continue` or `restart` after inspecting the existing work. The host harness controls when your agent receives a background result.
 
+Job state lives in one SQLite database per repository (`state.sqlite`, WAL mode), so concurrent jobs no longer rewrite a single `state.json` wholesale. The first write imports an existing `state.json` once, keeps it as `state.json.migrated`, and continues publishing `state.json` as an export for external readers. Details: [State and background jobs](docs/REFERENCE.md#state-and-background-jobs).
+
 **Full reference →** [docs/REFERENCE.md](docs/REFERENCE.md) (flags, permission model, jobs/state, troubleshooting, upgrading). **Release notes →** [docs/releases/](docs/releases/).
 
 ## Build one for another CLI

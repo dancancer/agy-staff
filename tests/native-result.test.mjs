@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createNativeErrorCollector, nativeResult } from '../companion/observation.mjs';
+import { StateStore } from '../companion/state-db.mjs';
 import { sandbox, run, jobIdOf, waitForJob, agyCalls } from './helpers.mjs';
 
 // Field shape measured with real AGY 1.4.12 against a localhost HTTP 400 stub
@@ -153,10 +154,23 @@ test('background partial timeout stays done, retains events and exposes metadata
   assert.doesNotMatch(observed.stdout, /PARTIAL_ANSWER/);
   assert.ok(Buffer.byteLength(observed.stdout) <= 8192);
   // Publish-before-registry race: the terminal sidecar must carry the metadata.
-  const stateFile = path.join(sb.repo, '.agy-staff', 'state.json');
-  const state = JSON.parse(fs.readFileSync(stateFile));
-  state.jobs[0].status = 'running'; delete state.jobs[0].agy;
-  fs.writeFileSync(stateFile, JSON.stringify(state));
+  // Simulate the registry lagging behind in whichever store is live (SQLite
+  // once the job has written, plain state.json otherwise).
+  const stateDir = path.join(sb.repo, '.agy-staff');
+  const stateFile = path.join(stateDir, 'state.json');
+  const rollbackRegistry = (mutate) => {
+    if (fs.existsSync(path.join(stateDir, 'state.sqlite'))) {
+      const store = new StateStore(path.join(stateDir, 'state.sqlite'));
+      const state = store.loadState();
+      mutate(state);
+      store.saveState(state);
+      store.close();
+    }
+    const mirror = JSON.parse(fs.readFileSync(stateFile));
+    mutate(mirror);
+    fs.writeFileSync(stateFile, JSON.stringify(mirror));
+  };
+  rollbackRegistry((state) => { state.jobs[0].status = 'running'; delete state.jobs[0].agy; });
   assert.equal(JSON.parse(run(sb, ['observe', id]).stdout).agy.finished_reason, 'print_timeout');
   assert.equal(nativeLine(run(sb, ['result', id]).stderr).finished_reason, 'print_timeout');
 });

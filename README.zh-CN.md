@@ -174,6 +174,8 @@ install and verify the agy-staff plugin for the harness you are running in. Resp
 
 等待到期不会停止后台任务。任务本身有独立的执行时限，默认 60 分钟，可以在启动时用 `--timeout` 调整，最长 120 分钟。需要停止时使用 `cancel`；需要继续或重新开始时，由主 agent 根据你的要求调用 `continue` 或 `restart`。模型何时收到后台结果，仍由你使用的 agent 环境决定。
 
+作业状态存放在每个仓库一个的 SQLite 库（`state.sqlite`，WAL 模式）中，并发作业时不再整份重写 `state.json`。首次写入会自动导入既有 `state.json` 并保留为 `state.json.migrated`；`state.json` 仍会作为对外快照持续导出。详见 [状态与后台任务](docs/REFERENCE.md#state-and-background-jobs)。
+
 关于参数、权限、进度快照和恢复方式，可以查阅[完整参考手册](docs/REFERENCE.zh-CN.md)。各版本的改动记录在[发布说明](docs/releases/)中。
 
 ## 为其他 CLI 做一个
