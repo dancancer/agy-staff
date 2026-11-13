@@ -407,7 +407,13 @@ export function apply(ctx, options = {}) {
           },
           required: ["ok", "role", "job_id", "status", "output"],
         },
-        render: (_args, value) => [{ type: "text", text: value.output }],
+        render: (_args, value) => {
+          const content = [{ type: "text", text: value.output }];
+          if (value.ok && value.status === "done" && value.job_id) {
+            content.push({ type: "text", text: `job_id: ${value.job_id}` });
+          }
+          return content;
+        },
       },
       async execute(args, exec) {
         const cwd = resolveSessionCwd(toolCtx, exec?.agent);
@@ -438,10 +444,13 @@ export function apply(ctx, options = {}) {
           cwd,
           signal: exec?.signal,
         });
-        const job_id = extractJobId(res.stdout) || String(args.job_id || "");
-        const status = !res.ok ? "error" : role === "ask" ? "done" : "running";
+        // Foreground ask reports its job ID in companion telemetry on stderr.
+        const askJobId = /^\[agy-staff\] mode=ask profile=\S+ model=\S+ job=(ask-[a-z0-9-]+)\s/mu.exec(res.stderr)?.[1];
+        const isAsk = role === "ask" || Boolean(askJobId);
+        const job_id = (isAsk ? askJobId : extractJobId(res.stdout)) || String(args.job_id || "");
+        const status = !res.ok ? "error" : isAsk ? "done" : "running";
         let output = (res.stdout || res.stderr || "No output").trim();
-        if (res.ok && role !== "ask" && job_id) {
+        if (status === "running" && job_id) {
           output += `\n\nNext: call agy_job with {"action":"wait","job_id":"${job_id}"} to collect the result.`;
         }
         return { ok: res.ok, role, job_id, status, output };

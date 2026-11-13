@@ -5,6 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import dshPlugin, { apply as applyDsh, name as dshPluginName } from "../dsh/index.mjs";
+import { agyCalls, run, sandbox } from "./helpers.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..");
@@ -364,21 +365,6 @@ test("Items 1, 4, 6, 7: dsh/index.mjs skills hydration, lifecycle tools, and /ag
     "xhigh",
   ]);
 
-  // Worker role: "ask" returns status: "done"
-  executedRunnerCalls.length = 0;
-  runnerMockResponse = {
-    ok: true,
-    code: 0,
-    stdout: "job id: ask-123\nDirect answer here",
-    stderr: "",
-  };
-  const workerAskRes = await workerTool.execute(
-    { role: "ask", prompt: "Quick question" },
-    { agent: fakeAgentWithCwd }
-  );
-  assert.equal(workerAskRes.ok, true);
-  assert.equal(workerAskRes.status, "done");
-
   // 5. Verify agy_job lifecycle
   // action: "wait"
   executedRunnerCalls.length = 0;
@@ -526,6 +512,54 @@ test("Items 1, 4, 6, 7: dsh/index.mjs skills hydration, lifecycle tools, and /ag
   });
   assert.equal(ctlClearDemo.kind, "error");
   assert.ok(ctlClearDemo.text.includes('Unknown /agy-ctl action "clear-demo"'));
+});
+
+test("agy_worker returns the recorded ask job ID for continuation", async () => {
+  const sb = sandbox("dsh-ask-job-id");
+  const tools = new Map();
+  const conversation = "conv-dsh-ask";
+  const firstAnswer = "id: ask-from-answer-text\nFirst answer";
+  applyDsh({
+    inject(deps, register) {
+      if (deps.includes("tools")) {
+        register({ tools: { register: (tool) => tools.set(tool.name, tool) } });
+      }
+    },
+  }, {
+    runCompanion: async (args) => {
+      const result = run(sb, args, {
+        FAKE_AGY_CONVERSATION_ID: conversation,
+        FAKE_AGY_RESPONSE: args[0] === "ask" ? firstAnswer : "Second answer",
+      });
+      return { ...result, ok: result.code === 0 };
+    },
+  });
+
+  const worker = tools.get("agy_worker");
+  const exec = { agent: { session: { header: { cwd: sb.repo } } } };
+  const first = await worker.execute({ role: "ask", prompt: "First question" }, exec);
+  assert.equal(first.ok, true, first.output);
+  assert.equal(first.status, "done");
+  assert.equal(first.output, firstAnswer);
+  assert.match(first.job_id, /^ask-[a-z0-9]+-[0-9a-f]{8}$/u);
+  assert.deepEqual(worker.output.render({}, first), [
+    { type: "text", text: firstAnswer },
+    { type: "text", text: `job_id: ${first.job_id}` },
+  ]);
+
+  const continued = await worker.execute({ role: "ask", prompt: "Follow up", job_id: first.job_id }, exec);
+  assert.equal(continued.ok, true, continued.output);
+  assert.equal(continued.status, "done");
+  assert.equal(continued.output, "Second answer");
+  assert.match(continued.job_id, /^ask-[a-z0-9]+-[0-9a-f]{8}$/u);
+  assert.notEqual(continued.job_id, first.job_id);
+  const followUpArgs = agyCalls(sb).at(-1);
+  assert.ok(followUpArgs.includes("--conversation"));
+  assert.equal(followUpArgs[followUpArgs.indexOf("--conversation") + 1], conversation);
+
+  const stored = run(sb, ["status", continued.job_id]);
+  assert.equal(stored.code, 0, stored.stderr);
+  assert.equal(JSON.parse(stored.stdout).parent_job_id, first.job_id);
 });
 
 test("Items 2, 3, 5: client UI loadTurnData running->done transition, recent_activities, polling efficiency, and status icons", async () => {
