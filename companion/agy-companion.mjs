@@ -96,7 +96,7 @@ import { randomUUID } from 'node:crypto';
 import { boundSnapshot, excerpt, createNativeErrorCollector, nativeResult, hasNativeWarnings } from './observation.mjs';
 import { atomicJSON, runStreaming, processIdentity } from './stream-worker.mjs';
 import { withStateLock, replaceFile, readTextRetry } from './state-lock.mjs';
-import { StateStore, sqliteCtor, STATE_DB_FILENAME, STATE_BACKUP_FILENAME } from './state-db.mjs';
+import { StateStore, sqliteCtor, STATE_DB_FILENAME, STATE_BACKUP_FILENAME, STATE_EXPORT_ID } from './state-db.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 const TEMPLATES_DIR = path.join(path.dirname(SELF), '..', 'templates');
@@ -384,11 +384,14 @@ const CONFIGURABLE_MODES = ['staffer', 'research', 'review', 'implement'];
  *  Missing file → null. Invalid file → die: a policy that is silently ignored
  *  is worse than an error. */
 function loadProjectConfig() {
+  const file = configPath();
   let raw;
   try {
-    raw = fs.readFileSync(configPath(), 'utf8');
-  } catch {
-    return null;
+    // lstat sees dangling symlinks, which must report a read error.
+    if (!fs.lstatSync(file, { throwIfNoEntry: false })) return null;
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (error) {
+    die(`cannot read project config ${file}: ${error.message}`);
   }
   let cfg;
   try {
@@ -467,11 +470,20 @@ function readJsonState() {
   }
 }
 
-function loadState() {
+function readStateSnapshot() {
+  try {
+    return JSON.parse(readTextRetry(statePath()));
+  } catch {
+    // With SQLite the export is optional, even when it cannot be read.
+    return null;
+  }
+}
+
+function loadState(snapshot) {
   if (!storeReady()) return readJsonState();
   try {
     stateStore ||= new StateStore(storePath());
-    return stateStore.loadState();
+    return stateStore.loadState(snapshot === undefined ? readStateSnapshot() : snapshot);
   } catch (error) {
     // Same doctrine as the JSON path: never mistake an unreadable store for
     // "no state" — the next save would wipe every job record.
@@ -504,28 +516,48 @@ function writeStateJson(state) {
   // Atomic replace: a detached worker and a status/result call can read this
   // file at any moment; a plain truncate-then-write leaves a torn window.
   const tmp = statePath() + `.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n');
-  replaceFile(tmp, statePath());
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n');
+    replaceFile(tmp, statePath());
+  } catch (error) {
+    try { fs.rmSync(tmp, { force: true }); } catch {}
+    throw error;
+  }
 }
 
-function saveState(state) {
-  ensureStateDir();
-  const inStore = storeReady();
-  if (inStore) {
+function stateExport(state, previous) {
+  return { previous, next: { ...exportSnapshot(state), [STATE_EXPORT_ID]: randomUUID() } };
+}
+
+function publishStateSnapshot(snapshot) {
+  try {
+    writeStateJson(snapshot);
+    return true;
+  } catch (error) {
+    process.stderr.write(`agy-staff warning: could not export ${statePath()}: ${error.message}\n`);
+    return false;
+  }
+}
+
+function saveState(state, previous) {
+  if (storeReady()) {
+    const exported = stateExport(state, previous);
     try {
-      stateStore ||= new StateStore(storePath());
-      stateStore.saveState(state);
+      stateStore.saveState(state, exported);
     } catch (error) {
       die(`cannot write state database ${storePath()}: ${error.message}`);
     }
+    if (publishStateSnapshot(exported.next)) {
+      try {
+        stateStore.confirmExport();
+      } catch (error) {
+        process.stderr.write(`agy-staff warning: could not confirm state export ${statePath()}: ${error.message}\n`);
+      }
+    }
+    return;
   }
-  // state.json doubles as the legacy store (while no database exists) and as
-  // the one-way exported snapshot for external readers (DSH sidebar, older
-  // companion builds, humans). With a database the export carries only the
-  // live page (see exportSnapshot); the companion itself reads state.json
-  // only when the database is absent, so there is no diverging second source
-  // of truth.
-  writeStateJson(inStore ? exportSnapshot(state) : state);
+  // In JSON-only mode this is the authoritative write and must succeed.
+  writeStateJson(state);
 }
 
 /** Import an existing state.json into state.sqlite once, on the first write.
@@ -536,45 +568,42 @@ function migrateStateToStore() {
   if (!sqliteCtor()) return; // Node without node:sqlite keeps the JSON path
   const imported = readJsonState(); // dies on a corrupt file; missing → empty
   const initPath = `${storePath()}.init-${process.pid}`;
+  const exported = stateExport(imported, imported);
   try {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(initPath + suffix, { force: true });
     const boot = new StateStore(initPath);
-    boot.importState(imported);
-    boot.integrityCheck();
-    boot.close();
+    try {
+      boot.importState(imported, exported);
+      boot.integrityCheck();
+    } finally {
+      boot.close();
+    }
+    // Keep the original readable by legacy workers even if export fails.
+    const legacy = statePath();
+    if (fs.existsSync(legacy)) {
+      let backup = path.join(stateDir(), STATE_BACKUP_FILENAME);
+      if (fs.existsSync(backup)) backup += `.${randomUUID()}`;
+      fs.copyFileSync(legacy, backup, fs.constants.COPYFILE_EXCL);
+    }
     fs.renameSync(initPath, storePath());
   } catch (error) {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(initPath + suffix, { force: true });
     die(`state migration to ${STATE_DB_FILENAME} failed: ${error.message}`);
   }
-  // Keep the original file as a migration backup (never delete it). The next
-  // saveState republishes state.json as the fresh exported snapshot.
-  const legacy = statePath();
-  if (fs.existsSync(legacy)) {
-    let backup = path.join(stateDir(), STATE_BACKUP_FILENAME);
-    if (fs.existsSync(backup)) {
-      backup = path.join(stateDir(), `${STATE_BACKUP_FILENAME}.${new Date().toISOString().slice(0, 19).replaceAll(':', '-')}`);
-    }
-    try { fs.renameSync(legacy, backup); } catch {}
-  }
   // Republish the exported snapshot immediately (already page-sized): a
   // command whose change() dies before saveState() must not leave external
   // readers without state.json while the migrated database owns the truth.
-  writeStateJson(exportSnapshot(imported));
-  try {
-    stateStore = new StateStore(storePath());
-  } catch (error) {
-    die(`cannot open migrated state database ${storePath()}: ${error.message}`);
-  }
+  publishStateSnapshot(exported.next);
 }
 
 function updateState(change) {
   ensureStateDir();
   return withStateLock(statePath() + '.lock', () => {
     migrateStateToStore();
-    const state = loadState();
+    const snapshot = storeReady() ? readStateSnapshot() : null;
+    const state = loadState(snapshot);
     const value = change(state);
-    saveState(state);
+    saveState(state, snapshot);
     return value;
   });
 }

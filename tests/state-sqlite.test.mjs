@@ -20,7 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { StateStore } from '../companion/state-db.mjs';
-import { sandbox, run, jobIdOf, waitForJob, COMPANION } from './helpers.mjs';
+import { sandbox, run, jobIdOf, waitForCalls, waitForJob, COMPANION } from './helpers.mjs';
 
 const stateDirOf = (sb) => path.join(sb.repo, '.agy-staff');
 const mirrorOf = (sb) => path.join(stateDirOf(sb), 'state.json');
@@ -46,6 +46,21 @@ function fullSeed() {
     jobs: [seedJob('research-seed-done'), seedJob('research-seed-error', 'error')],
     conversation_configs: { 'conv-1': { mode: 'research', model: 'gemini-test', profile: 'restricted', cwd: '/tmp/seed' } },
     future_field: { nested: [1, 2, 3] },
+  };
+}
+
+function failSnapshotReplacement(sb) {
+  const hook = `
+    import fs from 'node:fs';
+    const rename = fs.renameSync;
+    fs.renameSync = (source, target) => {
+      if (target === process.env.AGY_TEST_EXPORT_PATH) throw Object.assign(new Error('injected export failure'), { code: 'EIO' });
+      return rename(source, target);
+    };
+  `;
+  return {
+    NODE_OPTIONS: `--import=data:text/javascript;base64,${Buffer.from(hook).toString('base64')}`,
+    AGY_TEST_EXPORT_PATH: mirrorOf(sb),
   };
 }
 
@@ -125,6 +140,195 @@ test('AGY_STAFF_LEGACY_JSON=1 keeps the JSON-only path and can switch later', ()
   const modern = run(sb, ['cancel', 'research-seed-error']);
   assert.equal(modern.code, 0, modern.stderr);
   assert.ok(fs.existsSync(dbOf(sb)), 'dropping the env var migrates on the next write');
+});
+
+test('a legacy writer can add a job to an existing unmarked JSON snapshot', () => {
+  const sb = sandbox('sqlite-legacy-new-job');
+  const original = fullSeed();
+  seedJson(sb, original);
+  const initialStore = new StateStore(dbOf(sb));
+  initialStore.importState(original);
+  initialStore.close();
+
+  const legacy = run(sb, ['ask', '--prompt', 'Run this from the old client'], {
+    AGY_STAFF_LEGACY_JSON: '1', FAKE_AGY_CONVERSATION_ID: 'conv-legacy-ask',
+  });
+  assert.equal(legacy.code, 0, legacy.stderr);
+  const legacyId = jobIdOf(legacy.stderr);
+  const status = run(sb, ['status', legacyId]);
+  assert.equal(status.code, 0, status.stderr);
+  assert.match(status.stdout, /conv-legacy-ask/);
+
+  const modern = run(sb, ['ask', '--prompt', 'Run this from the new client'], {
+    FAKE_AGY_CONVERSATION_ID: 'conv-modern-ask',
+  });
+  assert.equal(modern.code, 0, modern.stderr);
+  const store = new StateStore(dbOf(sb));
+  const state = store.loadState();
+  store.close();
+  assert.ok(state.jobs.some((job) => job.id === legacyId && job.status === 'done'));
+  assert.ok(state.jobs.some((job) => job.id === jobIdOf(modern.stderr)));
+  assert.ok(state.conversation_configs['conv-legacy-ask']);
+  assert.ok(JSON.parse(fs.readFileSync(mirrorOf(sb), 'utf8')).jobs.some((job) => job.id === legacyId));
+});
+
+test('legacy writes can be imported from a marked export that omits older jobs', () => {
+  const sb = sandbox('sqlite-legacy-paged');
+  const seed = fullSeed();
+  seed.jobs.push(...Array.from({ length: 32 }, (_, index) => ({
+    ...seedJob(`research-later-${index}`), started_at: '2026-11-01T00:00:00Z',
+  })));
+  seedJson(sb, seed);
+  const migrate = run(sb, ['cancel', seed.jobs[0].id]);
+  assert.equal(migrate.code, 0, migrate.stderr);
+  const before = JSON.parse(fs.readFileSync(mirrorOf(sb), 'utf8'));
+  assert.equal(before.jobs.length, 32);
+  assert.ok(!before.jobs.some((job) => job.id === seed.jobs[0].id));
+
+  const legacy = run(sb, ['ask', '--prompt', 'Add a job to the paged snapshot'], {
+    AGY_STAFF_LEGACY_JSON: '1', FAKE_AGY_CONVERSATION_ID: 'conv-legacy-paged',
+  });
+  assert.equal(legacy.code, 0, legacy.stderr);
+  const legacyId = jobIdOf(legacy.stderr);
+  const synced = run(sb, ['cancel', legacyId]);
+  assert.equal(synced.code, 0, synced.stderr);
+  const store = new StateStore(dbOf(sb));
+  const state = store.loadState();
+  store.close();
+  assert.equal(state.jobs.length, seed.jobs.length + 1, 'a missing job on the page is not a deletion');
+  assert.ok(state.jobs.some((job) => job.id === legacyId));
+  assert.equal(state.conversations.ask, 'conv-legacy-paged');
+  assert.equal(state.last.id, 'conv-legacy-paged');
+});
+
+test('a legacy worker can finish a registered job after migration', async () => {
+  const sb = sandbox('sqlite-legacy-worker');
+  const seed = fullSeed();
+  seedJson(sb, seed);
+  const release = path.join(sb.root, 'release-agy');
+  const legacyEnv = { AGY_STAFF_LEGACY_JSON: '1' };
+  const started = run(sb, ['research', '--prompt', 'Finish after migration', '--timeout', '30s'], {
+    ...legacyEnv, FAKE_AGY_RELEASE_FILE: release, FAKE_AGY_CONVERSATION_ID: 'conv-legacy-worker',
+  });
+  assert.equal(started.code, 0, started.stderr);
+  const id = jobIdOf(started.stdout);
+
+  try {
+    await waitForCalls(sb, 1);
+    const migrate = run(sb, ['cancel', seed.jobs[0].id]);
+    assert.equal(migrate.code, 0, migrate.stderr);
+    assert.ok(fs.existsSync(dbOf(sb)));
+  } finally {
+    fs.writeFileSync(release, '');
+  }
+  const waited = run(sb, ['wait', id, '--timeout', '30s'], legacyEnv);
+  assert.equal(waited.code, 0, waited.stderr);
+  await waitForJob(sb, id);
+  const sync = run(sb, ['cancel', seed.jobs[0].id]);
+  assert.equal(sync.code, 0, sync.stderr);
+
+  const store = new StateStore(dbOf(sb));
+  const job = store.loadState().jobs.find((entry) => entry.id === id);
+  store.close();
+  assert.equal(job.status, 'done', 'SQLite must record the terminal state, even without the result sidecar');
+  const mirror = JSON.parse(fs.readFileSync(mirrorOf(sb), 'utf8'));
+  assert.equal(mirror.jobs.find((entry) => entry.id === id).status, 'done');
+});
+
+test('a failed snapshot replacement lets the job finish and the next write repairs the export', () => {
+  const sb = sandbox('sqlite-export-failure');
+  const seed = fullSeed();
+  seedJson(sb, seed);
+  const migrate = run(sb, ['cancel', seed.jobs[0].id]);
+  assert.equal(migrate.code, 0, migrate.stderr);
+  const before = fs.readFileSync(mirrorOf(sb), 'utf8');
+  const failExport = {
+    ...failSnapshotReplacement(sb),
+    FAKE_AGY_CONVERSATION_ID: 'conv-with-failed-export',
+  };
+  const started = run(sb, ['research', '--prompt', 'Complete despite the failed export'], failExport);
+  assert.equal(started.code, 0, started.stderr);
+  assert.match(started.stderr, /warning: .*export .*state\.json.*injected export failure/i);
+  const id = jobIdOf(started.stdout);
+  const waited = run(sb, ['wait', id, '--timeout', '30s']);
+  assert.equal(waited.code, 0, waited.stdout + waited.stderr);
+  assert.match(waited.stdout, /fake answer/);
+  assert.equal(fs.readFileSync(mirrorOf(sb), 'utf8'), before, 'the last good snapshot remains available');
+  assert.equal(fs.readdirSync(stateDirOf(sb)).some((name) => name.startsWith('state.json.tmp-')), false);
+
+  const legacy = run(sb, ['ask', '--prompt', 'Write to the last good snapshot'], {
+    AGY_STAFF_LEGACY_JSON: '1', FAKE_AGY_CONVERSATION_ID: 'conv-during-export-failure',
+  });
+  assert.equal(legacy.code, 0, legacy.stderr);
+  const legacyId = jobIdOf(legacy.stderr);
+  const retry = run(sb, ['cancel', seed.jobs[0].id]);
+  assert.equal(retry.code, 0, retry.stderr);
+  const mirror = JSON.parse(fs.readFileSync(mirrorOf(sb), 'utf8'));
+  for (const jobId of [id, legacyId]) {
+    assert.equal(mirror.jobs.find((job) => job.id === jobId)?.status, 'done');
+  }
+  assert.equal(mirror.conversations.research, 'conv-with-failed-export', 'a stale legacy snapshot must not reset a newer conversation');
+});
+
+test('a failed first export keeps the original JSON available to older workers', () => {
+  const sb = sandbox('sqlite-initial-export-failure');
+  const seed = fullSeed();
+  const runningId = 'research-legacy-running';
+  seed.jobs.push({ ...seedJob(runningId, 'running'), finished_at: null, conversation_id: null });
+  const original = seedJson(sb, seed);
+  const migrated = run(sb, ['cancel', seed.jobs[0].id], failSnapshotReplacement(sb));
+  assert.equal(migrated.code, 0, migrated.stderr);
+  assert.match(migrated.stderr, /could not export .*injected export failure/);
+  assert.equal(fs.readFileSync(mirrorOf(sb), 'utf8'), original);
+  assert.equal(fs.readFileSync(backupOf(sb), 'utf8'), original);
+
+  Object.assign(seed.jobs.at(-1), { status: 'done', finished_at: '2026-11-13T00:00:00Z', conversation_id: 'conv-after-first-export' });
+  seedJson(sb, seed);
+  const synced = run(sb, ['cancel', runningId]);
+  assert.equal(synced.code, 0, synced.stderr);
+  const store = new StateStore(dbOf(sb));
+  try {
+    const job = store.loadState().jobs.find((entry) => entry.id === runningId);
+    assert.equal(job.status, 'done');
+    assert.equal(job.conversation_id, 'conv-after-first-export');
+  } finally {
+    store.close();
+  }
+});
+
+test('a broken JSON export destination does not block SQLite jobs or revive stale state', () => {
+  const sb = sandbox('sqlite-export-destination');
+  const seed = fullSeed();
+  const runningId = 'research-legacy-running';
+  seed.jobs.push({ ...seedJob(runningId, 'running'), finished_at: null, conversation_id: null });
+  seedJson(sb, seed);
+  const migrate = run(sb, ['cancel', seed.jobs[0].id]);
+  assert.equal(migrate.code, 0, migrate.stderr);
+  const saved = `${mirrorOf(sb)}.saved`;
+  fs.renameSync(mirrorOf(sb), saved);
+  fs.mkdirSync(mirrorOf(sb));
+
+  const done = run(sb, ['ask', '--prompt', 'Complete from SQLite'], {
+    FAKE_AGY_CONVERSATION_ID: 'conv-with-missing-export',
+  });
+  assert.equal(done.code, 0, done.stderr);
+  assert.match(done.stderr, /could not export .*state\.json/);
+  const id = jobIdOf(done.stderr);
+  assert.equal(run(sb, ['wait', id]).code, 0);
+
+  fs.rmdirSync(mirrorOf(sb));
+  fs.renameSync(saved, mirrorOf(sb));
+  const legacy = JSON.parse(fs.readFileSync(mirrorOf(sb), 'utf8'));
+  Object.assign(legacy.jobs.find((job) => job.id === runningId), {
+    status: 'done', finished_at: '2026-11-13T00:00:00Z', conversation_id: 'conv-after-restoring-export',
+  });
+  seedJson(sb, legacy);
+  const retry = run(sb, ['cancel', seed.jobs[0].id]);
+  assert.equal(retry.code, 0, retry.stderr);
+  const snapshot = JSON.parse(fs.readFileSync(mirrorOf(sb), 'utf8'));
+  assert.equal(snapshot.jobs.find((job) => job.id === id)?.status, 'done');
+  assert.equal(snapshot.last.id, 'conv-with-missing-export');
+  assert.equal(snapshot.jobs.find((job) => job.id === runningId)?.conversation_id, 'conv-after-restoring-export');
 });
 
 test('concurrent writers under the state lock lose nothing; readers never fail', async () => {

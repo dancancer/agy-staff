@@ -124,4 +124,29 @@ describe('profile precedence: flag > project policy > default', () => {
     assert.notEqual(r.code, 0);
     assert.match(r.stderr, /project config is corrupt/);
   });
+
+  test('an unreadable project policy stops review before dispatch', () => {
+    const sb = sandbox('policy-unreadable');
+    const setup = run(sb, ['setup', '--restrict', 'review']);
+    assert.equal(setup.code, 0, setup.stderr);
+    const config = configFile(sb);
+    fs.renameSync(config, `${config}.saved`);
+    fs.mkdirSync(config);
+
+    const review = run(sb, ['review', '--prompt', 'Review the tree']);
+    assert.equal(review.code, 1, review.stdout + review.stderr);
+    assert.match(review.stderr, /cannot read project config .*config\.json/);
+    assert.equal(fs.existsSync(path.join(path.dirname(config), 'jobs')), false);
+  });
+
+  test('a dangling project policy symlink is a read error', { skip: process.platform === 'win32' }, () => {
+    const sb = sandbox('policy-dangling-link');
+    const config = configFile(sb);
+    fs.mkdirSync(path.dirname(config));
+    fs.symlinkSync(`${config}.missing`, config);
+
+    const review = run(sb, ['review', '--prompt', 'Review the tree']);
+    assert.equal(review.code, 1, review.stdout + review.stderr);
+    assert.match(review.stderr, /cannot read project config .*config\.json/);
+  });
 });

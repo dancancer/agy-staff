@@ -18,23 +18,71 @@
  * instead of a read failure. Writes use BEGIN IMMEDIATE so a read-modify-write
  * cycle takes the write lock up front.
  *
- * `state.json` stays on disk as a one-way exported snapshot (written after
- * every state save). External readers — the DSH sidebar, humans, and older
- * companion builds — keep working from it; only this process family reads the
- * database, so there is no double-write divergence inside the companion.
+ * Older companions can still write the paged `state.json`. The export ID
+ * survives their writes, so we can merge their changes against the right page.
  */
-import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import { isDeepStrictEqual } from 'node:util';
 
 const require = createRequire(import.meta.url);
 
 export const STATE_DB_FILENAME = 'state.sqlite';
 export const STATE_BACKUP_FILENAME = 'state.json.migrated';
+export const STATE_EXPORT_ID = '_agy_staff_export_id';
 export const SCHEMA_VERSION = 1;
 
-const KNOWN_TOP_LEVEL = new Set(['conversations', 'last', 'jobs', 'conversation_configs']);
+const KNOWN_TOP_LEVEL = new Set(['conversations', 'last', 'jobs', 'conversation_configs', STATE_EXPORT_ID]);
 
 let sqliteChecked = null;
+
+function mergeEntries(current, legacy, baseline = {}) {
+  for (const [key, value] of Object.entries(legacy)) {
+    // A failed export can leave stale fields on disk. Keep SQLite's value
+    // when it has also changed since this page was read or published.
+    if (Object.hasOwn(current, key) !== Object.hasOwn(baseline, key)) continue;
+    if (!isDeepStrictEqual(current[key], baseline[key]) || isDeepStrictEqual(current[key], value)) continue;
+    Object.defineProperty(current, key, { value: structuredClone(value), enumerable: true, writable: true, configurable: true });
+  }
+  for (const [key, value] of Object.entries(baseline)) {
+    if (!Object.hasOwn(legacy, key) && isDeepStrictEqual(current[key], value)) delete current[key];
+  }
+}
+
+function mergeLegacyState(state, legacy, baseline) {
+  if (!Array.isArray(legacy?.jobs) || isDeepStrictEqual(legacy, baseline)) return state;
+  const currentJobs = new Map(state.jobs.map((job) => [job.id, job]));
+  const exportedJobs = new Map((baseline?.jobs || []).map((job) => [job.id, job]));
+  for (const job of legacy.jobs) {
+    if (typeof job?.id !== 'string') continue;
+    const current = currentJobs.get(job.id);
+    const exported = exportedJobs.get(job.id);
+    if (!current) {
+      const imported = structuredClone(job);
+      state.jobs.push(imported);
+      currentJobs.set(job.id, imported);
+    } else if (exported && current.status === exported.status) {
+      // Keep terminal status and its metadata together if SQLite has already
+      // finished a job that the old snapshot still considered running.
+      mergeEntries(current, job, exported);
+    } else if (!baseline && current.status === 'running' && job.finished_at &&
+        ['done', 'error', 'canceled', 'attention'].includes(job.status)) {
+      // Databases made before export tracking can still recover legacy completions.
+      Object.assign(current, { status: job.status, finished_at: job.finished_at });
+      mergeEntries(current, job, {});
+    }
+  }
+  for (const key of ['conversations', 'conversation_configs']) {
+    mergeEntries(state[key], legacy[key] || {}, baseline?.[key]);
+  }
+  if (Object.hasOwn(legacy, 'last') && isDeepStrictEqual(state.last, baseline ? baseline.last : null)) {
+    state.last = structuredClone(legacy.last);
+  }
+  for (const [key, value] of Object.entries(legacy)) {
+    if (KNOWN_TOP_LEVEL.has(key) || Object.hasOwn(state, key)) continue;
+    Object.defineProperty(state, key, { value: structuredClone(value), enumerable: true, writable: true, configurable: true });
+  }
+  return state;
+}
 
 /** Load `node:sqlite` once. Older Node (< 22.5, or < 23.4 without the
  *  experimental flag) cannot resolve it: callers then keep using the legacy
@@ -51,6 +99,8 @@ export function sqliteCtor() {
 }
 
 export class StateStore {
+  #stateExport = null;
+
   constructor(dbPath) {
     const DatabaseSync = sqliteCtor();
     if (!DatabaseSync) {
@@ -100,35 +150,54 @@ export class StateStore {
     return { jobs, conversations, configs, meta };
   }
 
-  loadState() {
+  loadState(legacy = null) {
+    this.db.exec('BEGIN');
+    try {
+      const state = this.#readState();
+      // saveState must diff against the database rows, including legacy changes.
+      this.snapshot = this.#snapshotFrom(state);
+      this.#stateExport = null;
+      const row = this.db.prepare("SELECT value FROM meta WHERE key = 'state_export'").get();
+      if (row) this.#stateExport = JSON.parse(row.value);
+      if (legacy) {
+        const { previous, next } = this.#stateExport || {};
+        const baseline = [next, previous].find((page) => page && page[STATE_EXPORT_ID] === legacy[STATE_EXPORT_ID]);
+        mergeLegacyState(state, legacy, baseline);
+      }
+      this.db.exec('COMMIT');
+      return state;
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch {}
+      throw error;
+    }
+  }
+
+  confirmExport() {
+    this.#stateExport.previous = this.#stateExport.next;
+    this.db.prepare("UPDATE meta SET value = ? WHERE key = 'state_export'").run(JSON.stringify(this.#stateExport));
+  }
+
+  #readState() {
     const db = this.db;
     const jobs = db.prepare('SELECT data FROM jobs ORDER BY seq').all().map((row) => JSON.parse(row.data));
     const conversations = Object.fromEntries(
       db.prepare('SELECT mode, conversation_id FROM conversations ORDER BY mode').all().map((r) => [r.mode, r.conversation_id])
     );
-    const conversation_configs = {};
-    for (const row of db.prepare('SELECT id, data FROM conversation_configs').all()) {
-      conversation_configs[row.id] = JSON.parse(row.data);
-    }
+    const conversation_configs = Object.fromEntries(
+      db.prepare('SELECT id, data FROM conversation_configs').all().map((row) => [row.id, JSON.parse(row.data)])
+    );
     let last = null;
     const extras = [];
     for (const row of db.prepare('SELECT key, value FROM meta').all()) {
       if (row.key === 'last') last = JSON.parse(row.value);
       else if (row.key.startsWith('extra:')) extras.push([row.key.slice('extra:'.length), JSON.parse(row.value)]);
     }
-    const state = {};
-    for (const [key, value] of extras) state[key] = value;
-    state.conversations = conversations;
-    state.last = last;
-    state.jobs = jobs;
-    state.conversation_configs = conversation_configs;
-    this.snapshot = this.#snapshotFrom(state);
-    return state;
+    return { ...Object.fromEntries(extras), conversations, last, jobs, conversation_configs };
   }
 
   /** Persist `state`. Diffs against the snapshot taken by the last loadState
    *  (or a full replace when there is none), inside one IMMEDIATE transaction. */
-  saveState(state) {
+  saveState(state, stateExport) {
     const db = this.db;
     const next = this.#snapshotFrom(state);
     const prev = this.snapshot;
@@ -169,18 +238,25 @@ export class StateStore {
       if (prevMeta) {
         for (const key of prevMeta.keys()) if (!next.meta.has(key)) delMeta.run(key);
       }
+      if (stateExport) {
+        // The last readable page still matters while the JSON file is missing
+        // or unreadable. A successful rename advances it via confirmExport().
+        stateExport.previous ??= this.#stateExport?.previous ?? null;
+        upMeta.run('state_export', JSON.stringify(stateExport));
+      }
       db.exec('COMMIT');
     } catch (error) {
       try { db.exec('ROLLBACK'); } catch {}
       throw error;
     }
     this.snapshot = next;
+    if (stateExport) this.#stateExport = stateExport;
   }
 
   /** One-shot full import (used by the state.json migration). */
-  importState(state) {
+  importState(state, stateExport) {
     this.snapshot = null;
-    this.saveState(state);
+    this.saveState(state, stateExport);
   }
 
   /** Integrity probe used by migration and tests. Throws on a malformed file. */

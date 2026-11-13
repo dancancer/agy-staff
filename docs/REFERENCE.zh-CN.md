@@ -228,7 +228,11 @@ review --prompt "Review the patch at /tmp/change.patch"
 
 标准输出保存任务结果，以及需要随结果展示的工作区警告。`[agy-staff]` 开头的运行信息记录模式、权限、模型、耗时、用量和会话 ID；前台运行时写入标准错误，后台运行时写入 `jobs/<id>.log`。这些信息供调用方排查问题，不属于回答正文，也不会写入 `jobs/<id>.result.md`。
 
-仓库内的状态保存在 `<repo>/.agy-staff/`。`state.json` 记录会话和任务状态，更新时使用短事务锁；进度查询只读取状态。`config.json` 保存可选的仓库权限策略。
+仓库内的状态保存在 `<repo>/.agy-staff/`。SQLite（`state.sqlite`，WAL 模式）保存完整任务和会话历史。首次写入会在状态锁内导入 `state.json`，并将原文件复制为 `state.json.migrated`。导出的 `state.json` 包含所有未结束的任务，剩余位置用最新完成的任务补齐，默认最多 32 条，可通过 `AGY_STAFF_EXPORT_RECENT_JOBS` 设置。更早的已完成任务仍保存在 SQLite 中。
+
+旧版 companion 仍可写入 `state.json`。新版会读取其中新建的任务和可合并的更新，并在下一次写入时通过同一把状态锁保存到 SQLite。两边都改了同一字段时，以 SQLite 为准。SQLite 提交后如果导出失败，命令会提示警告，保留上次可读的快照，并在下一次写入时重试。使用 SQLite 的命令仍可启动、收取和完成任务。
+
+尚未创建数据库时，不支持 `node:sqlite` 的 Node 仍使用 JSON，也可通过 `AGY_STAFF_LEGACY_JSON=1` 跳过自动迁移。设置该变量后，companion 使用 JSON 快照，快照以外的历史任务可通过 SQLite 查询。`config.json` 保存可选的仓库权限策略。
 
 每个任务还有自己的执行规格、诊断日志、结果文件和最终状态文件，以及原始输出 `.events.jsonl` 和进度快照 `.progress.json`。快照通过原子替换发布，原始输出则可能保留尚未识别或格式无效的事件。旧任务即使没有活动文件，仍可读取已有状态和结果。
 
