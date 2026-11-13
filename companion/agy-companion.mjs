@@ -479,6 +479,29 @@ function readStateSnapshot() {
   }
 }
 
+let jobSnapshot;
+
+function readJobSnapshot() {
+  try {
+    const stat = fs.statSync(statePath(), { bigint: true });
+    // Both writers replace the JSON atomically. The inode and high-resolution
+    // timestamps also distinguish rapid replacements and edits in place.
+    const version = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+    if (version !== jobSnapshot?.version) {
+      const snapshot = readStateSnapshot();
+      jobSnapshot = Array.isArray(snapshot?.jobs) ? {
+        version,
+        exportId: snapshot[STATE_EXPORT_ID] ?? null,
+        jobs: new Map(snapshot.jobs.filter((job) => typeof job?.id === 'string').map((job) => [job.id, job])),
+      } : null;
+    }
+    return jobSnapshot;
+  } catch {
+    jobSnapshot = null;
+    return null;
+  }
+}
+
 /** Reconcile registry rows that outlived their workers: a job stuck on
  *  running/queued whose final state update was lost (typically a pre-migration
  *  worker that rewrote the JSON mirror without touching the database). The
@@ -553,10 +576,13 @@ function loadState(snapshot) {
     stateStore ||= new StateStore(storePath());
     return reconcileJobs(stateStore.loadState(snapshot === undefined ? readStateSnapshot() : snapshot));
   } catch (error) {
-    // Same doctrine as the JSON path: never mistake an unreadable store for
-    // "no state" — the next save would wipe every job record.
-    die(`cannot read state database ${storePath()}: ${error.message} — repair it or move it aside (state.json keeps the latest exported snapshot), then retry`);
+    stateReadError(error);
   }
+}
+
+function stateReadError(error) {
+  // An unreadable database must fail visibly to protect the stored jobs.
+  die(`cannot read state database ${storePath()}: ${error.message} — repair it or move it aside (state.json keeps the latest exported snapshot), then retry`);
 }
 
 // The DSH sidebar polls state.json through a line-paged file read (default
@@ -2090,8 +2116,20 @@ async function cmdWait(opts) {
 }
 
 function findJob(id) {
-  const jobs = loadState().jobs || [];
-  const job = id ? jobs.find((j) => j.id === id) : ([...jobs].reverse().find((j) => j.mode !== 'ask') || jobs.at(-1));
+  let job;
+  if (id && storeReady()) {
+    try {
+      stateStore ||= new StateStore(storePath());
+      const snapshot = readJobSnapshot();
+      job = stateStore.loadJob(id, snapshot?.jobs.get(id), snapshot?.exportId);
+    } catch (error) {
+      stateReadError(error);
+    }
+    if (job) reconcileJobs({ jobs: [job] });
+  } else {
+    const jobs = loadState().jobs || [];
+    job = id ? jobs.find((j) => j.id === id) : ([...jobs].reverse().find((j) => j.mode !== 'ask') || jobs.at(-1));
+  }
   if (!job) die(id ? `no job ${id} in this repository` : 'no agy-staff jobs recorded in this repository');
   return job;
 }

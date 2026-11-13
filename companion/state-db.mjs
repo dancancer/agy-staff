@@ -48,6 +48,19 @@ function mergeEntries(current, legacy, baseline = {}) {
   }
 }
 
+function mergeLegacyJob(current, legacy, exported, hasBaseline) {
+  if (exported && current.status === exported.status) {
+    // Keep terminal status and its metadata together if SQLite has already
+    // finished a job that the old snapshot still considered running.
+    mergeEntries(current, legacy, exported);
+  } else if (!hasBaseline && current.status === 'running' && legacy.finished_at &&
+      ['done', 'error', 'canceled', 'attention'].includes(legacy.status)) {
+    // Databases made before export tracking can still recover legacy completions.
+    Object.assign(current, { status: legacy.status, finished_at: legacy.finished_at });
+    mergeEntries(current, legacy, {});
+  }
+}
+
 function mergeLegacyState(state, legacy, baseline) {
   if (!Array.isArray(legacy?.jobs) || isDeepStrictEqual(legacy, baseline)) return state;
   const currentJobs = new Map(state.jobs.map((job) => [job.id, job]));
@@ -60,15 +73,8 @@ function mergeLegacyState(state, legacy, baseline) {
       const imported = structuredClone(job);
       state.jobs.push(imported);
       currentJobs.set(job.id, imported);
-    } else if (exported && current.status === exported.status) {
-      // Keep terminal status and its metadata together if SQLite has already
-      // finished a job that the old snapshot still considered running.
-      mergeEntries(current, job, exported);
-    } else if (!baseline && current.status === 'running' && job.finished_at &&
-        ['done', 'error', 'canceled', 'attention'].includes(job.status)) {
-      // Databases made before export tracking can still recover legacy completions.
-      Object.assign(current, { status: job.status, finished_at: job.finished_at });
-      mergeEntries(current, job, {});
+    } else {
+      mergeLegacyJob(current, job, exported, Boolean(baseline));
     }
   }
   for (const key of ['conversations', 'conversation_configs']) {
@@ -100,6 +106,8 @@ export function sqliteCtor() {
 
 export class StateStore {
   #stateExport = null;
+  #selectJob;
+  #readJobBaseline;
 
   constructor(dbPath) {
     const DatabaseSync = sqliteCtor();
@@ -131,6 +139,48 @@ export class StateStore {
 
   close() {
     this.db.close();
+  }
+
+  /** Read one job, reconciling only that row with the JSON export. */
+  loadJob(id, legacy, exportId) {
+    this.#selectJob ||= this.db.prepare('SELECT data FROM jobs WHERE id = ?');
+    if (!legacy) {
+      const row = this.#selectJob.get(id);
+      return row ? JSON.parse(row.data) : null;
+    }
+
+    this.db.exec('BEGIN');
+    try {
+      const row = this.#selectJob.get(id);
+      const current = row ? JSON.parse(row.data) : structuredClone(legacy);
+      if (row && !isDeepStrictEqual(current, legacy)) {
+        // Select the matching page inside SQLite and return only its job row.
+        // A matching page with no such row is distinct from an unknown page.
+        this.#readJobBaseline ||= this.db.prepare(`
+          WITH baseline AS (
+            SELECT CASE
+              WHEN json_type(value, '$.next') = 'object' AND json_extract(value, '$.next.${STATE_EXPORT_ID}') IS ?
+                THEN '$.next'
+              WHEN json_type(value, '$.previous') = 'object' AND json_extract(value, '$.previous.${STATE_EXPORT_ID}') IS ?
+                THEN '$.previous'
+            END AS page, value
+            FROM meta WHERE key = 'state_export'
+          )
+          SELECT page, (
+            SELECT job.value FROM json_each(baseline.value, page || '.jobs') AS job
+            WHERE json_extract(job.value, '$.id') = ? LIMIT 1
+          ) AS job FROM baseline
+        `);
+        const baseline = this.#readJobBaseline.get(exportId, exportId, id);
+        const exported = baseline?.job ? JSON.parse(baseline.job) : null;
+        mergeLegacyJob(current, legacy, exported, Boolean(baseline?.page));
+      }
+      this.db.exec('COMMIT');
+      return current;
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch {}
+      throw error;
+    }
   }
 
   #snapshotFrom(state) {

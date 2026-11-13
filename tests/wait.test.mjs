@@ -9,6 +9,9 @@
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { StateStore } from '../companion/state-db.mjs';
 import { sandbox, run, jobIdOf, jobLog, waitForJob } from './helpers.mjs';
 
 describe('status <id> exit codes', () => {
@@ -128,5 +131,93 @@ describe('wait', () => {
     const r = run(sb, ['wait']);
     assert.equal(r.code, 0, r.stderr);
     assert.match(r.stdout, new RegExp(`# Job ${id} `));
+  });
+
+  test('bare wait keeps its initial job when a newer job is registered', () => {
+    const sb = sandbox('wait-pinned');
+    const statePath = path.join(sb.repo, '.agy-staff', 'state.json');
+    fs.mkdirSync(path.dirname(statePath));
+    const first = {
+      id: 'research-first', mode: 'research', status: 'running', pid: process.pid,
+      result_file: path.join(sb.repo, 'first.md'),
+    };
+    const second = { ...first, id: 'research-second', status: 'done', result_file: path.join(sb.repo, 'second.md') };
+    const completedState = JSON.stringify({ jobs: [{ ...first, status: 'done' }, second] });
+    fs.writeFileSync(statePath, JSON.stringify({ jobs: [first] }));
+    fs.writeFileSync(first.result_file, 'First result\n');
+    fs.writeFileSync(second.result_file, 'Second result\n');
+
+    // Publish both completions just after the waiter checks its initial job's
+    // sidecar. The next poll must still collect the first result.
+    const hook = `
+      import fs from 'node:fs';
+      const read = fs.readFileSync;
+      fs.readFileSync = (file, ...args) => {
+        if (file === ${JSON.stringify(first.result_file + '.status.json')}) {
+          fs.readFileSync = read;
+          fs.writeFileSync(${JSON.stringify(statePath)}, ${JSON.stringify(completedState)});
+        }
+        return read(file, ...args);
+      };
+    `;
+    const waiter = run(sb, ['wait', '--timeout', '5s'], {
+      NODE_OPTIONS: `--import=data:text/javascript;base64,${Buffer.from(hook).toString('base64')}`,
+    });
+    assert.equal(waiter.code, 0, waiter.stdout + waiter.stderr);
+    assert.equal(waiter.stdout, '# Job research-first (research, done)\n\nFirst result\n');
+  });
+
+  test('wait with an ID polls only its SQLite job and notices a legacy completion', (t) => {
+    const sb = sandbox('wait-sqlite-by-id');
+    t.after(() => fs.rmSync(sb.root, { recursive: true, force: true }));
+    const dir = path.join(sb.repo, '.agy-staff');
+    const mirror = path.join(dir, 'state.json');
+    const log = path.join(sb.root, 'reads.log');
+    fs.mkdirSync(dir);
+    const job = { id: 'research-target', mode: 'research', status: 'running', pid: process.pid,
+      result_file: path.join(dir, 'result.md'), log_file: path.join(dir, 'job.log') };
+    const snapshot = { jobs: [job], _agy_staff_export_id: 'original' };
+    const completed = { ...snapshot, jobs: [{ ...job, status: 'done', warnings: true, finished_at: '2026-11-14T00:00:00Z' }] };
+    fs.writeFileSync(mirror, JSON.stringify(snapshot));
+    fs.writeFileSync(job.result_file, 'Legacy result\n');
+    fs.writeFileSync(job.log_file, 'LEGACY_WARNING\n');
+    const store = new StateStore(path.join(dir, 'state.sqlite'));
+    store.importState(snapshot, { previous: snapshot, next: snapshot });
+    store.close();
+
+    // Leave the first few polls unchanged, then publish a JSON-only update
+    // while the SQLite row is still running. Trace real reads in the CLI.
+    const hook = `
+      import fs from 'node:fs';
+      import { DatabaseSync } from 'node:sqlite';
+      const mirror = ${JSON.stringify(mirror)};
+      const log = ${JSON.stringify(log)};
+      const read = fs.readFileSync;
+      let polls = 0;
+      fs.readFileSync = (file, ...args) => {
+        if (file === mirror) fs.appendFileSync(log, 'mirror\\n');
+        if (file === ${JSON.stringify(job.result_file + '.status.json')} && ++polls === 3) {
+          fs.writeFileSync(mirror + '.next', ${JSON.stringify(JSON.stringify(completed))});
+          fs.renameSync(mirror + '.next', mirror);
+        }
+        return read(file, ...args);
+      };
+      const prepare = DatabaseSync.prototype.prepare;
+      DatabaseSync.prototype.prepare = function (sql) {
+        if (/FROM jobs\\b/i.test(sql)) fs.appendFileSync(log, sql + '\\n');
+        return prepare.call(this, sql);
+      };
+    `;
+    const waited = run(sb, ['wait', job.id, '--timeout', '5s'], {
+      NODE_OPTIONS: `--import=data:text/javascript;base64,${Buffer.from(hook).toString('base64')}`,
+    });
+    assert.equal(waited.code, 0, waited.stdout + waited.stderr);
+    assert.equal(waited.stdout, `# Job ${job.id} (research, done)\n\nLegacy result\n`);
+    assert.match(waited.stderr, /LEGACY_WARNING/);
+    const reads = fs.readFileSync(log, 'utf8').trim().split('\n');
+    const queries = reads.filter((line) => /FROM jobs\b/i.test(line));
+    assert.ok(queries.length > 0, 'wait queried SQLite');
+    assert.ok(queries.every((sql) => /\bWHERE id\s*=\s*\?/i.test(sql)), queries.join('\n'));
+    assert.equal(reads.filter((line) => line === 'mirror').length, 2, 'unchanged snapshots are reused');
   });
 });
