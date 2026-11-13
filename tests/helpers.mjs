@@ -118,12 +118,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /**
  * Wait, read-only, until the detached worker has written the job's result file
  * (both the success and the failure path write it) and then settle briefly so
- * the worker's final state.json update lands.
+ * the worker's final state update lands.
  *
- * Why not just poll `status`: every companion command rewrites state.json, so
- * polling *while* the worker runs exercises the residual concurrent
- * read-modify-write window (lost updates) instead of the interface under test.
- * See tests/README.md ("State-file races").
+ * Why not just poll `status`: before the SQLite state store every companion
+ * command rewrote state.json, so polling *while* the worker ran exercised the
+ * residual concurrent read-modify-write window (lost updates) instead of the
+ * interface under test. See tests/README.md ("State-file races") and the
+ * state-store note in docs/REFERENCE.md.
  */
 // Windows workers pay for PowerShell process-table queries at startup and on
 // cleanup; a cold runner can spend most of the 10 s POSIX budget on those.
