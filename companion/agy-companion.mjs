@@ -479,11 +479,79 @@ function readStateSnapshot() {
   }
 }
 
+/** Reconcile registry rows that outlived their workers: a job stuck on
+ *  running/queued whose final state update was lost (typically a pre-migration
+ *  worker that rewrote the JSON mirror without touching the database). The
+ *  evidence must be exactly what finishJob would have written: a non-empty
+ *  result.md, plus a dead worker process or a recorded finished_at. The
+ *  final sidecar decides the verdict when present; otherwise the report's
+ *  first line picks done vs. attention. Runs on the loaded view, so
+ *  read-only commands display the truth and write commands persist it;
+ *  exportSnapshot applies it too, so the sidebar page never shows a zombie. */
+function reconcileJobs(state) {
+  for (const job of Array.isArray(state.jobs) ? state.jobs : []) {
+    if (!job || !['running', 'queued'].includes(job.status)) continue;
+    const file = job.result_file || path.join(stateDir(), 'jobs', `${job.id}.result.md`);
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      continue;
+    }
+    if (!stat.size) continue;
+    // At least one pid must be recorded, and every recorded pid confirmed
+    // dead. A missing pid is a pending backfill, not evidence of death —
+    // unless finished_at already proves the run ended.
+    const dead = (job.pid != null || job.agy_pid != null)
+      && !(job.pid != null && pidAlive(job.pid))
+      && !(job.agy_pid != null && pidAlive(job.agy_pid));
+    if (!dead && !job.finished_at) continue;
+    // The final sidecar is the authoritative verdict; without it, the
+    // report's first line distinguishes an attention stop from success.
+    // Deciding here — not only masking the status later — is what keeps the
+    // export page honest: the sidebar renders stored statuses verbatim.
+    let final = null;
+    let status = readTerminalStatus(file);
+    if (status) {
+      try {
+        final = JSON.parse(fs.readFileSync(file + '.status.json', 'utf8'));
+      } catch {}
+    } else {
+      let head = '';
+      try {
+        const fd = fs.openSync(file, 'r');
+        try {
+          const buffer = Buffer.alloc(4096);
+          head = buffer.toString('utf8', 0, fs.readSync(fd, buffer, 0, 4096, 0));
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch {
+        continue;
+      }
+      status = head.split('\n', 1)[0].includes('Job needs attention') ? 'attention' : 'done';
+    }
+    job.status = status;
+    if (final) {
+      if (final.reason && !job.reason) job.reason = final.reason;
+      if (final.finished_at) job.finished_at = final.finished_at;
+      // Carry the remaining finishJob metadata too: delivery paths key the
+      // diagnostics tail off job.warnings, and the sidecar may be the only
+      // record of it once the registry update was lost.
+      if (final.warnings) job.warnings = true;
+      if (final.agy && !job.agy) job.agy = final.agy;
+    }
+    if (!job.finished_at) job.finished_at = stat.mtime.toISOString();
+    if (!job.reconciled_by) job.reconciled_by = 'companion-read-reconcile';
+  }
+  return state;
+}
+
 function loadState(snapshot) {
-  if (!storeReady()) return readJsonState();
+  if (!storeReady()) return reconcileJobs(readJsonState());
   try {
     stateStore ||= new StateStore(storePath());
-    return stateStore.loadState(snapshot === undefined ? readStateSnapshot() : snapshot);
+    return reconcileJobs(stateStore.loadState(snapshot === undefined ? readStateSnapshot() : snapshot));
   } catch (error) {
     // Same doctrine as the JSON path: never mistake an unreadable store for
     // "no state" — the next save would wipe every job record.
@@ -501,7 +569,8 @@ function loadState(snapshot) {
 const EXPORT_RECENT_JOBS = Math.max(0, Number(process.env.AGY_STAFF_EXPORT_RECENT_JOBS) || 32);
 const LIVE_JOB_STATUSES = ['running', 'queued', 'attention'];
 
-function exportSnapshot(state) {
+function exportSnapshot(rawState) {
+  const state = reconcileJobs(rawState); // the unfinished-page picks use reconciled status
   const jobs = Array.isArray(state.jobs) ? state.jobs : [];
   const live = jobs.filter((job) => job && LIVE_JOB_STATUSES.includes(job.status));
   const liveSet = new Set(live);
@@ -1933,12 +2002,18 @@ function refreshJobs(state) {
   for (const job of state.jobs || []) job.status = liveJobStatus(job);
 }
 
-function liveJobStatus(job) {
-  if (['done', 'canceled', 'error', 'attention'].includes(job.status)) return job.status;
+function readTerminalStatus(resultFile) {
   try {
-    const final = JSON.parse(fs.readFileSync(job.result_file + '.status.json', 'utf8'));
+    const final = JSON.parse(fs.readFileSync(resultFile + '.status.json', 'utf8'));
     if (['done', 'error', 'canceled', 'attention'].includes(final.status)) return final.status;
   } catch {}
+  return null;
+}
+
+function liveJobStatus(job) {
+  if (['done', 'canceled', 'error', 'attention'].includes(job.status)) return job.status;
+  const finalStatus = readTerminalStatus(job.result_file);
+  if (finalStatus) return finalStatus;
   if (pidAlive(job.pid)) return 'running';
   // New jobs publish an explicit result status; never infer success from an
   // error report left behind by a worker that died before updating state.
@@ -1994,29 +2069,20 @@ const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
  *  chosen to sit under a typical harness per-command timeout); expiring is NOT
  *  a failure: exit code 2 means "still running — call wait again". */
 async function cmdWait(opts) {
-  const id = opts._[0] || null;
   const timeout = opts.timeout || '100s';
   const budget = durationToMs(timeout);
   if (!Number.isFinite(budget)) die(`invalid --timeout "${timeout}" (examples: 100s, 5m)`);
 
   // Wait silently: callers use observe for progress, not periodic liveness text.
-  // Read-only lookup: the poll loop must never write state.json, or it races
-  // the worker's own final read-modify-write (see liveJobStatus).
-  const findTarget = () => {
-    const jobs = loadState().jobs || [];
-    if (id) return jobs.find((j) => j.id === id) || null;
-    return [...jobs].reverse().find((j) => j.mode !== 'ask') || jobs.at(-1) || null;
-  };
-  let job = findTarget();
-  if (!job) die(id ? `no job ${id} in this repository` : 'no agy-staff jobs recorded in this repository');
+  let job = findJob(opts._[0]);
+  const id = job.id;
 
   const POLL_MS = 200;
   const start = Date.now();
   let status = liveJobStatus(job);
   while (status === 'running' && Date.now() - start < budget) {
     await sleepMs(Math.min(POLL_MS, budget - (Date.now() - start)));
-    job = findTarget();
-    if (!job) die(`job record disappeared from state.json`);
+    job = findJob(id);
     status = liveJobStatus(job);
   }
 

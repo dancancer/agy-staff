@@ -173,7 +173,7 @@ review --prompt "Review the patch at /tmp/change.patch"
 
 默认流程是：写好 prompt → 派发 → 等待最终结果 → 按需验收。任务运行中不主动 `observe`、查 `status`、读日志或检查中间产物，也不为例行汇报查询进度。只有用户明确询问进度时才观测；收到失败或需要介入的结果后再诊断。
 
-`wait [id] [--timeout <dur>]` 会等到任务完成，或本次等待到期。完成时返回完整结果；等待到期但任务仍在运行时，返回当前的 JSON 快照，并让 worker 继续执行。普通的工具活动不会提前结束等待。直接运行 `wait` 时默认等待 100 秒，技能建议显式使用 `--timeout 10m`。退出码 2 只表示本次等待到期，应继续等待同一任务；附带快照不要求检查进度或介入。
+`wait [id] [--timeout <dur>]` 会等到任务完成，或本次等待到期。省略 ID 时，命令在启动时选中最近的后台任务。如果只有 `ask` 任务，就选中最近的一条。本次等待始终指向启动时选中的任务。完成时返回完整结果。等待到期但任务仍在运行时，返回当前的 JSON 快照，并让 worker 继续执行。普通的工具活动不会提前结束等待。直接运行 `wait` 时默认等待 100 秒，技能建议显式使用 `--timeout 10m`。退出码为 2 时，使用快照里的 `job_id` 继续等待同一任务。
 
 `observe [id]` 用于立即查看任务。运行中返回进展，完成后返回最终状态、结果路径和收取提示；失败、取消或崩溃时，还会附上有长度限制的诊断和恢复信息。它始终返回 JSON，最多 8 KiB，不包含完整报告。
 
@@ -228,7 +228,7 @@ review --prompt "Review the patch at /tmp/change.patch"
 
 标准输出保存任务结果，以及需要随结果展示的工作区警告。`[agy-staff]` 开头的运行信息记录模式、权限、模型、耗时、用量和会话 ID；前台运行时写入标准错误，后台运行时写入 `jobs/<id>.log`。这些信息供调用方排查问题，不属于回答正文，也不会写入 `jobs/<id>.result.md`。
 
-仓库内的状态保存在 `<repo>/.agy-staff/`。SQLite（`state.sqlite`，WAL 模式）保存完整任务和会话历史。首次写入会在状态锁内导入 `state.json`，并将原文件复制为 `state.json.migrated`。导出的 `state.json` 包含所有未结束的任务，剩余位置用最新完成的任务补齐，默认最多 32 条，可通过 `AGY_STAFF_EXPORT_RECENT_JOBS` 设置。更早的已完成任务仍保存在 SQLite 中。
+仓库内的状态保存在 `<repo>/.agy-staff/`。SQLite（`state.sqlite`，WAL 模式）保存完整任务和会话历史。首次写入会在状态锁内导入 `state.json`，并将原文件复制为 `state.json.migrated`。导出的 `state.json` 包含所有未结束的任务，剩余位置用最新完成的任务补齐，默认最多 32 条，可通过 `AGY_STAFF_EXPORT_RECENT_JOBS` 设置。更早的已完成任务仍保存在 SQLite 中。worker 已死但未完成最终状态更新的 running/queued 行会在每次读取与导出时对账修正：依据是存在且非空的 `jobs/<id>.result.md`，加上已退出的进程号（或已记录的 `finished_at`）；终态 sidecar 存在时以它为准，否则由结果首行判定 done 或 attention，并补写 `finished_at` 与 `reconciled_by`，下一次写入时持久化。侧边栏因此不会显示僵尸行。
 
 旧版 companion 仍可写入 `state.json`。新版会读取其中新建的任务和可合并的更新，并在下一次写入时通过同一把状态锁保存到 SQLite。两边都改了同一字段时，以 SQLite 为准。SQLite 提交后如果导出失败，命令会提示警告，保留上次可读的快照，并在下一次写入时重试。使用 SQLite 的命令仍可启动、收取和完成任务。
 
@@ -405,6 +405,7 @@ dsh plugin --profile desktop add github:keli-wen/agy-staff
 
 DSH 适配器包含三部分：
 - **原生 Cordis 工具（`dsh/index.mjs`）**：注册 `agy_brain`（通过 `staffer --brain` 调用 Gemini 4 Carbon / Argon，默认使用 Gemini 4 Carbon，支持可选 `model` 与 `effort`）、`agy_worker`（支持 `job_id` 续接、可选 `model` 与 `effort` 以及 `restricted: true` 权限收紧）和 `agy_job`（`wait`、`observe`、`result`、`cancel`、`status`），在 DSH 命令沙箱外调用 `companion/agy-companion.mjs`，使 `agy` 能正常访问本机 language server 端口与钥匙串凭证。
+- **续问 `ask`**：用 `role: "ask"` 调用 `agy_worker` 时，`output` 是回答正文，`job_id` 是记录下来的 `ask-...` 任务 ID。下次调用 `agy_worker` 时传入该 ID 即可续接会话。每次续问完成后都会返回新的 `job_id`。
 - **`/agy-*` 技能注入**：复用 `opencode-skills/agy-*/SKILL.md` 作为单一技能源，在注册时将 `<skill-dir>` 与 `<plugin-root>` 替换为真实绝对路径，并引导模型优先调用原生工具。
 - **右侧可视化子代理面板（`dsh/client.js`）**：通过 `workspaceFiles.read` 读取 `<repo>/.agy-staff/state.json`、`.spec.json`、运行中的 `.progress.json` 与 `.result.md`，并通过 `/agy-ctl` 执行任务取消。
 

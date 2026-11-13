@@ -464,3 +464,66 @@ test('the exported snapshot keeps live jobs plus the latest page', () => {
   assert.equal(store.loadState().jobs.length, 40, 'the database keeps the full registry');
   store.close();
 });
+
+test('stale running rows reconcile from the result file on read and export', () => {
+  const sb = sandbox('sqlite-reconcile');
+  const jobs = path.join(stateDirOf(sb), 'jobs');
+  fs.mkdirSync(jobs, { recursive: true });
+  const row = (id, status, extra = {}) => ({
+    id, mode: 'review', status, pid: 99999999, started_at: '2026-09-01T00:00:00Z',
+    result_file: path.join(jobs, `${id}.result.md`), log_file: path.join(jobs, `${id}.log`), ...extra,
+  });
+  const staleDone = row('review-stale-done', 'running');
+  const staleAtt = row('review-stale-att', 'running');
+  const staleSidecar = row('review-stale-sidecar', 'running');
+  const aliveNoResult = row('review-alive-noresult', 'running', { pid: process.pid });
+  const aliveWithResult = row('review-alive-result', 'running', { pid: process.pid });
+  const deadNoResult = row('review-dead-noresult', 'running');
+  fs.writeFileSync(staleDone.result_file, 'Review report\n\ncontent\n');
+  fs.writeFileSync(staleAtt.result_file, 'Job needs attention: conversation is resumable\n');
+  fs.writeFileSync(aliveWithResult.result_file, 'Report mid-flight\n');
+  fs.writeFileSync(staleSidecar.result_file, 'Abandoned run\n');
+  fs.writeFileSync(staleSidecar.result_file + '.status.json',
+    JSON.stringify({ status: 'canceled', reason: 'canceled', finished_at: '2026-09-09T00:00:00Z' }));
+  seedJson(sb, {
+    conversations: {}, last: null,
+    jobs: [staleDone, staleAtt, staleSidecar, aliveNoResult, aliveWithResult, deadNoResult, seedJob('review-seed-done')],
+  });
+
+  const cancel = run(sb, ['cancel', 'review-seed-done']);
+  assert.equal(cancel.code, 0, cancel.stderr);
+
+  const mirror = JSON.parse(fs.readFileSync(mirrorOf(sb), 'utf8'));
+  const byId = new Map(mirror.jobs.map((j) => [j.id, j]));
+  assert.equal(byId.get('review-stale-done').status, 'done', 'result evidence overrides the stuck status in the export');
+  assert.ok(byId.get('review-stale-done').finished_at, 'finished_at is backfilled from the result mtime');
+  assert.equal(byId.get('review-stale-done').reconciled_by, 'companion-read-reconcile');
+  assert.equal(byId.get('review-stale-att').status, 'attention', 'a needs-attention report reconciles to attention');
+  assert.equal(byId.get('review-stale-sidecar').status, 'canceled', 'the final sidecar is the authoritative verdict');
+  assert.equal(byId.get('review-stale-sidecar').finished_at, '2026-09-09T00:00:00Z', 'the sidecar stamp beats the file mtime');
+  assert.equal(byId.get('review-stale-sidecar').reconciled_by, 'companion-read-reconcile');
+  assert.equal(byId.get('review-alive-noresult').status, 'running', 'a live worker without a result is untouched');
+  assert.equal(byId.get('review-alive-result').status, 'running', 'a live worker with a result is untouched');
+  assert.ok(!byId.get('review-alive-result').reconciled_by);
+  assert.equal(byId.get('review-dead-noresult').status, 'running', 'a dead pid alone is not evidence without a result');
+
+  // The correction persists into the database through the same save.
+  const store = new StateStore(dbOf(sb));
+  const dbById = new Map(store.loadState().jobs.map((j) => [j.id, j]));
+  store.close();
+  assert.equal(dbById.get('review-stale-done').status, 'done');
+  assert.equal(dbById.get('review-stale-att').status, 'attention');
+  assert.equal(dbById.get('review-alive-result').status, 'running');
+
+  // Reconciled zombies no longer claim a slot as unfinished.
+  assert.deepEqual(
+    mirror.jobs.filter((j) => ['running', 'queued', 'attention'].includes(j.status)).map((j) => j.id).sort(),
+    ['review-alive-noresult', 'review-alive-result', 'review-dead-noresult', 'review-stale-att'].sort(),
+    'only live workers, the result-less dead row, and the attention verdict count as unfinished');
+
+  // Read-only commands keep displaying the truth without writing.
+  const before = fs.readFileSync(mirrorOf(sb), 'utf8');
+  const status = run(sb, ['status']);
+  assert.equal(status.code, 0, status.stderr);
+  assert.equal(fs.readFileSync(mirrorOf(sb), 'utf8'), before, 'status stays read-only');
+});
