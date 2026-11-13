@@ -479,6 +479,27 @@ function loadState() {
   }
 }
 
+// The DSH sidebar polls state.json through a line-paged file read (default
+// page: 5000 lines; a paged file reports truncated and the panel keeps its
+// empty state). A whole-registry export grew past that ceiling and became
+// invisible, so the snapshot exports a page instead: every unfinished job
+// plus the newest finished ones up to EXPORT_RECENT_JOBS entries (readers
+// themselves show at most the latest 32). The database keeps the full
+// registry; state.json.migrated keeps the full pre-migration original.
+const EXPORT_RECENT_JOBS = Math.max(0, Number(process.env.AGY_STAFF_EXPORT_RECENT_JOBS) || 32);
+const LIVE_JOB_STATUSES = ['running', 'queued', 'attention'];
+
+function exportSnapshot(state) {
+  const jobs = Array.isArray(state.jobs) ? state.jobs : [];
+  const live = jobs.filter((job) => job && LIVE_JOB_STATUSES.includes(job.status));
+  const liveSet = new Set(live);
+  const recent = new Set(jobs
+    .filter((job) => !liveSet.has(job))
+    .sort((a, b) => String(b?.started_at || '').localeCompare(String(a?.started_at || '')))
+    .slice(0, Math.max(0, EXPORT_RECENT_JOBS - live.length)));
+  return { ...state, jobs: jobs.filter((job) => liveSet.has(job) || recent.has(job)) };
+}
+
 function writeStateJson(state) {
   // Atomic replace: a detached worker and a status/result call can read this
   // file at any moment; a plain truncate-then-write leaves a torn window.
@@ -489,7 +510,8 @@ function writeStateJson(state) {
 
 function saveState(state) {
   ensureStateDir();
-  if (storeReady()) {
+  const inStore = storeReady();
+  if (inStore) {
     try {
       stateStore ||= new StateStore(storePath());
       stateStore.saveState(state);
@@ -499,9 +521,11 @@ function saveState(state) {
   }
   // state.json doubles as the legacy store (while no database exists) and as
   // the one-way exported snapshot for external readers (DSH sidebar, older
-  // companion builds, humans). The companion itself reads it only when the
-  // database is absent, so there is no diverging second source of truth.
-  writeStateJson(state);
+  // companion builds, humans). With a database the export carries only the
+  // live page (see exportSnapshot); the companion itself reads state.json
+  // only when the database is absent, so there is no diverging second source
+  // of truth.
+  writeStateJson(inStore ? exportSnapshot(state) : state);
 }
 
 /** Import an existing state.json into state.sqlite once, on the first write.
@@ -533,10 +557,10 @@ function migrateStateToStore() {
     }
     try { fs.renameSync(legacy, backup); } catch {}
   }
-  // Republish the exported snapshot immediately: a command whose change()
-  // dies before saveState() must not leave external readers without
-  // state.json while the migrated database already owns the truth.
-  writeStateJson(imported);
+  // Republish the exported snapshot immediately (already page-sized): a
+  // command whose change() dies before saveState() must not leave external
+  // readers without state.json while the migrated database owns the truth.
+  writeStateJson(exportSnapshot(imported));
   try {
     stateStore = new StateStore(storePath());
   } catch (error) {

@@ -219,3 +219,44 @@ test('database is created in WAL mode', () => {
   store.close();
   assert.equal(String(Object.values(mode)[0]).toLowerCase(), 'wal');
 });
+
+test('the exported snapshot keeps live jobs plus the latest page', () => {
+  const sb = sandbox('sqlite-export-page');
+  const jobs = [];
+  for (let i = 0; i < 40; i++) {
+    jobs.push({
+      id: `research-old-${String(i).padStart(2, '0')}`, mode: 'research', status: 'done', pid: 99999999,
+      started_at: new Date(Date.UTC(2026, 0, 1 + i)).toISOString(),
+      finished_at: new Date(Date.UTC(2026, 0, 1 + i, 1)).toISOString(),
+    });
+  }
+  jobs[5].status = 'running'; // started early: live jobs survive regardless of recency
+  jobs[17].status = 'queued';
+  jobs[33].status = 'attention';
+  const seed = {
+    conversations: { research: 'conv-1' }, last: null, jobs,
+    conversation_configs: { 'conv-1': { mode: 'research', model: 'gemini-test' } },
+  };
+  seedJson(sb, seed);
+  const cancel = run(sb, ['cancel', 'research-old-00']);
+  assert.equal(cancel.code, 0, cancel.stderr);
+
+  const mirror = JSON.parse(fs.readFileSync(mirrorOf(sb), 'utf8'));
+  assert.equal(mirror.jobs.length, 32, 'the export fits one latest page');
+  const ids = new Set(mirror.jobs.map((j) => j.id));
+  for (const live of ['research-old-05', 'research-old-17', 'research-old-33']) {
+    assert.ok(ids.has(live), `${live} (unfinished) must be exported even when outdated`);
+  }
+  const finishedDesc = jobs.filter((j) => !['running', 'queued', 'attention'].includes(j.status))
+    .sort((a, b) => b.started_at.localeCompare(a.started_at));
+  assert.ok(ids.has(finishedDesc[0].id), 'the newest finished record is exported');
+  assert.ok(ids.has(finishedDesc[28].id), 'the page fills up to 32 with the newest finished records');
+  assert.ok(!ids.has(finishedDesc[29].id), 'older finished records stay only in the database');
+  assert.equal(finishedDesc.filter((j) => ids.has(j.id)).length, 29);
+  assert.deepEqual(mirror.conversations, seed.conversations);
+  assert.deepEqual(mirror.conversation_configs, seed.conversation_configs);
+
+  const store = new StateStore(dbOf(sb));
+  assert.equal(store.loadState().jobs.length, 40, 'the database keeps the full registry');
+  store.close();
+});
