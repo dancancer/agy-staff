@@ -199,9 +199,7 @@ def trial_answer(job):
     task_dir = Path(cfg["task"]["path"])
     task_dir = task_dir if task_dir.is_absolute() else DATA / task_dir  # the run scripts start Harbor in <data>
     dataset = task_dir.parent.name
-    candidates = [trial / "agent" / "answer.txt", trial / "artifacts" / "workspace" / "answer.txt"]
-    answer = next((p.read_text() for p in candidates if p.is_file()), "")
-    return dataset, task_dir, answer, trial / "grading"
+    return dataset, task_dir, benchdata.trial_answer_text(trial), trial / "grading"
 
 
 def main():
@@ -214,7 +212,7 @@ def main():
   reference <dataset>/<task>... grade the dataset's own reference answer (a check of the judges)
   nop <dataset>/<task>...       grade a non-answer, which must fail (a check of the judges)
 Results go to <trial>/grading/<judge>/r<k>.json (or <data>/grading-<mode>/); existing results are kept
-unless --force. analyze.py reads them: a task is solved when every judge passes it in most of its runs.
+unless --force. analyze.py waits for rounds 1–3 from both judges. Each judge must pass at least two rounds.
 
 examples:
   grade.py jobs claude-agy-staff-deepsearchqa-0190-c55x-r1
@@ -227,8 +225,8 @@ for agents:
     benchdata.add_argument(ap)
     ap.add_argument("mode", choices=["jobs", "reference", "nop"], help="what to grade (see below)")
     ap.add_argument("items", nargs="+", help="job names, or <dataset>/<task>")
-    ap.add_argument("--judges", default=",".join(JUDGES), help="comma-separated (default: %(default)s)")
-    ap.add_argument("--repeats", type=int, default=3, help="runs per judge (default: %(default)s)")
+    ap.add_argument("--judges", default=",".join(benchdata.OFFLINE_JUDGES), help="comma-separated (default: %(default)s)")
+    ap.add_argument("--repeats", type=int, default=benchdata.OFFLINE_REPEATS, help="runs per judge (default: %(default)s)")
     ap.add_argument("--max-tokens", type=int, default=None, help="judge max_tokens (default: the official grader's)")
     ap.add_argument("--force", action="store_true", help="grade again even where results exist")
     args = ap.parse_args()

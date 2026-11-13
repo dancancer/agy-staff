@@ -323,24 +323,62 @@ def dispatches_from_host_log(trial, outputs=None):
     return out
 
 
-def grading(trial):
-    """Offline grades from grade.py, per judge: repeats, pass rate (QnA) or mean F1 (DeepSearchQA)."""
+def grading(trial, dataset):
+    """Summarize the three numbered rounds for each of the two offline judges."""
+    vote_key = benchdata.OFFLINE_VOTE_KEYS[dataset]
+    answer_empty = None
     out = {}
-    for d in sorted((trial / "grading").glob("*")):
-        rows = [json.loads(p.read_text()) for p in sorted(d.glob("r*.json"))]
+    for judge in benchdata.OFFLINE_JUDGES:
+        rows = []
+        for repeat in range(1, benchdata.OFFLINE_REPEATS + 1):
+            path = trial / "grading" / judge / f"r{repeat}.json"
+            try:
+                row = json.loads(path.read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+            if not isinstance(row, dict) or (row.get("dataset"), row.get("judge"), row.get("repeat")) != (dataset, judge, repeat):
+                continue
+            result = row.get("result")
+            if not isinstance(result, dict) or result.get(vote_key) not in (0, 1):
+                continue
+            if result.get("error") or (dataset == "deepsearchqa" and result.get("grader_valid") == 0):
+                # The grader writes the same zero for an empty answer and for a judge failure.
+                if answer_empty is None:
+                    answer_empty = not benchdata.trial_answer_text(trial).strip()
+                if not answer_empty or result[vote_key] != 0:
+                    continue
+            rows.append(row)
         if not rows:
             continue
         res = [r["result"] for r in rows]
         g = {"repeats": len(rows), "cost_usd": round(sum(r["usage"]["cost_usd"] for r in rows), 4)}
-        if rows[0]["dataset"] == "swe-atlas-qna":
+        if dataset == "swe-atlas-qna":
             g["pass_rate"] = sum(bool(x.get("pass")) for x in res) / len(res)
             g["unscored"] = sum(x.get("num_unscored") or 0 for x in res)
         else:
             g["f1_mean"] = round(sum(x.get("f1_score") or 0 for x in res) / len(res), 4)
             g["fully_correct_rate"] = sum(x.get("fully_correct") or 0 for x in res) / len(res)
             g["invalid"] = sum(1 for x in res if not x.get("grader_valid"))
-        out[d.name] = g
+        out[judge] = g
     return out or None
+
+
+def trial_verdict(trial, dataset, reward):
+    if dataset in benchdata.OFFLINE_VOTE_KEYS:
+        grades = grading(trial, dataset)
+        if not grades or any(grades.get(judge, {}).get("repeats") != benchdata.OFFLINE_REPEATS
+                             for judge in benchdata.OFFLINE_JUDGES):
+            return None, None, None, [], grades
+        vote_rate, reward_key = (("pass_rate", "pass_rate") if dataset == "swe-atlas-qna"
+                                 else ("fully_correct_rate", "f1_mean"))
+        resolved = all(grade[vote_rate] > 0.5 for grade in grades.values())
+        reward = round(sum(grade[reward_key] for grade in grades.values()) / len(grades), 4)
+        return resolved, reward, None, [], grades
+
+    # SWE-bench uses the verifier unless a failed test was counted as passing.
+    resolved_official = reward == 1.0
+    hidden_failures = swebench_hidden_failures(trial)
+    return resolved_official and not hidden_failures, 0.0 if hidden_failures else reward, resolved_official, hidden_failures, None
 
 
 # SymPy's runner prints one "test_name ok|F|E" line per test without the file, and SWE-bench's parser
@@ -494,22 +532,7 @@ def summarize(job, trial):
     else:
         worker_cost = sum(r["cost_usd"] for r in workers)
 
-    grades = grading(trial)
-    # Offline-graded datasets: resolved when every judge passes it in the majority of its repeats
-    # (QnA: all must-have rubrics; DeepSearchQA: fully correct). reward is then the mean over judges
-    # of the pass rate (QnA) or the mean F1 (DeepSearchQA).
-    if dataset in ("swe-atlas-qna", "deepsearchqa"):
-        key = "pass_rate" if dataset == "swe-atlas-qna" else "fully_correct_rate"
-        resolved = bool(grades) and all(g[key] >= 0.5 for g in grades.values())
-        reward = round(sum(g["pass_rate" if dataset == "swe-atlas-qna" else "f1_mean"] for g in grades.values())
-                       / len(grades), 4) if grades else None
-        resolved_official, hidden_failures = None, []
-    else:
-        # SWE-bench: the verifier's verdict, unless the log shows a test it counted as passed failing.
-        resolved_official, hidden_failures = reward == 1.0, swebench_hidden_failures(trial)
-        resolved = resolved_official and not hidden_failures
-        if hidden_failures:
-            reward = 0.0
+    resolved, reward, resolved_official, hidden_failures, grades = trial_verdict(trial, dataset, reward)
     return {
         "agy_staff_version": "%s (%s)" % agy_staff_provenance(trial),
         "host": "codex", "host_model": "+".join(m for r in host for m in r["models"]) or None,
@@ -790,19 +813,7 @@ def summarize_claude(job, trial):
         worker_cost = native_cost
     same_sub = add(host_tokens, native_tokens) if setup in CLAUDE_WORKER_MODEL else host_tokens
 
-    grades = grading(trial)
-    if dataset in ("swe-atlas-qna", "deepsearchqa"):
-        key = "pass_rate" if dataset == "swe-atlas-qna" else "fully_correct_rate"
-        resolved = bool(grades) and all(g[key] >= 0.5 for g in grades.values())
-        reward = round(sum(g["pass_rate" if dataset == "swe-atlas-qna" else "f1_mean"] for g in grades.values())
-                       / len(grades), 4) if grades else None
-        resolved_official, hidden_failures = None, []
-    else:
-        # SWE-bench: the verifier's verdict, unless the log shows a test it counted as passed failing.
-        resolved_official, hidden_failures = reward == 1.0, swebench_hidden_failures(trial)
-        resolved = resolved_official and not hidden_failures
-        if hidden_failures:
-            reward = 0.0
+    resolved, reward, resolved_official, hidden_failures, grades = trial_verdict(trial, dataset, reward)
     host_text = (trial / "agent" / "claude-code.txt").read_text(errors="replace")
     return {
         "agy_staff_version": "%s (%s)" % agy_staff_provenance(trial),

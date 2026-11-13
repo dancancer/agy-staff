@@ -68,7 +68,7 @@ v1 最初只在 SWE-bench Verified 上跑了"+ subagents"。2026-10-23 的补充
 
 - **运行框架：** [Harbor](https://github.com/harbor-framework/harbor) 0.24.0，每个 job 的 `lock.json` 都记录了这个版本。每次 trial 都在一个全新的容器里跑。容器用 benchmark 自己的镜像构建，再装上 host CLI、agy 和 agy-staff。
 - **agy-staff 版本：** 0.7.3（`f00d149`）。对 Claude Code 和 Codex 来说，0.7.4 没有改动任何 skill、companion 代码或 prompt 模板，所以这批结果也代表 0.7.4。
-- **评分：** SWE-bench 按测试评分。只有同名测试一个都没失败，才算通过：SWE-bench 的 SymPy 日志解析器按裸测试名记结果，后面同名的测试会盖掉前面的失败。v1 里这条规则改变了 1 道题的结果，官方的判定保留在 `data.json` 的 `resolved_official` 里。QnA 和 DeepSearchQA 在离线评分，沿用各数据集自己的评分 prompt、rubric 和汇总规则。和官方做法唯一的不同是评委模型：用 Gemini 3.8 Flash 和 DeepSeek V4 Pro，各评 3 次。只有两个评委各自多数判通过，才算解出。
+- **评分：** SWE-bench 按测试评分。只有同名测试一个都没失败，才算通过：SWE-bench 的 SymPy 日志解析器按裸测试名记结果，后面同名的测试会盖掉前面的失败。v1 里这条规则改变了 1 道题的结果，官方的判定保留在 `data.json` 的 `resolved_official` 里。QnA 和 DeepSearchQA 在离线评分，沿用各数据集自己的评分 prompt、rubric 和汇总规则。评委是 Gemini 3.8 Flash 和 DeepSeek V4 Pro。等两位评委各完成前三轮评分后，只有双方都至少判通过两次才算解出。待评分的试验暂时排除在解题率之外。
 - **成本：** 按 API 标价计，单位是美元。
   - host 成本是 host 模型自己用掉的部分，也就是从你的 Claude 或 ChatGPT 订阅里扣的那部分。
   - 总成本再加上 worker。自家 subagent 和 host 用同一份订阅；agy 按 Gemini 标价折算，但用的是 agy 自己的额度。

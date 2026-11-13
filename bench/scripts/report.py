@@ -7,7 +7,7 @@ One pair of tables per dataset. Trials flagged with an infra failure (usage_limi
 worker_unavailable, tool_failure) are left out and listed separately; trials whose tool output showed
 a benchmark answer key (answer_key_exposure) are marked ⚠. When a (dataset, setup, task, rep) has
 several valid records, e.g. an infra rerun, the record from the latest job is used. "resolved" for
-the offline-graded datasets comes from analyze.py (every judge passes in most of its repeats).
+the offline-graded datasets comes from analyze.py. Trials awaiting grades are listed separately.
 """
 
 import argparse
@@ -40,8 +40,9 @@ for agents:
     src = ap.parse_args().records
     recs = [json.loads(line) for line in src.read_text().splitlines() if line.strip()]
     infra = [r for r in recs if r["infra_flags"]]
+    pending = [r for r in recs if not r["infra_flags"] and r["resolved"] is None]
     valid = {}
-    for r in sorted((r for r in recs if not r["infra_flags"]), key=lambda r: r["job"]):
+    for r in sorted((r for r in recs if not r["infra_flags"] and r["resolved"] is not None), key=lambda r: r["job"]):
         valid[(f"{r.get('dataset', 'swebench-verified')} · host {r.get('host_model')} {r.get('host_effort')}",
                r["setup"], r["instance_id"], r["rep"])] = r
     for ds in sorted({k[0] for k in valid}):
@@ -72,6 +73,8 @@ for agents:
                   f"{round(st.median(r['wall_clock_s'] for r in rs) / 60, 1)} min |")
     if infra:
         print("\nExcluded (infra failures): " + ", ".join(f"`{r['job']}` ({', '.join(r['infra_flags'])})" for r in infra))
+    if pending:
+        print("\nPending grading: " + ", ".join(f"`{r['job']}`" for r in pending))
     exposed = [r["job"] for r in valid.values() if r.get("answer_key_exposure")]
     if exposed:
         print("\n⚠ Answer key seen in tool output: " + ", ".join(f"`{j}`" for j in exposed))

@@ -147,6 +147,8 @@ python3 bench/scripts/timeline.py <job>   # where one trial's time went
 
 `analyze.py` flags trials for review: `infra_flags` (usage limit, worker down, agent stalled), `cheat_flag` (git history, upstream fix, dataset lookups), `adhered` (whether the host followed the setup), and `answer_key_exposure`. Trials with infrastructure flags are rerun, never counted as unsolved.
 
+For offline grading, `analyze.py` uses `r1.json` through `r3.json` from each of the two judges. Once all six grades are present, a trial is solved if each judge passes at least two rounds. A grader error on a submitted answer leaves the round pending. Use `grade.py --force` to replace a saved error. Empty answers still receive failing votes. Until grading is complete, `resolved` and `reward` are `null`. `report.py` lists those trials as pending and `viz-data.py` leaves them out of published rates. Run `analyze.py` again after grading to update the records collected during the batch run.
+
 ## Publish a version
 
 1. List the runs the version publishes in `RUNS` in `scripts/viz-data.py`.

@@ -8,7 +8,7 @@ bench/results/v1/data.json is this script's output for v1, byte for byte.
 
 A run is one host configuration (model + effort) on one agy-staff build. Its trials are the formal jobs
 (suffix -r<n>, plus -rerun<k> reruns) of that host; for each (dataset, setup, task, rep) the latest valid
-record is kept, as in report.py, and trials flagged with an infra failure are left out. Runs are keyed
+record is kept, as in report.py, and trials with infra failures or pending grades are left out. Runs are keyed
 by agy-staff version, so results from later plugin versions add new series instead of replacing these.
 Tokens: input (uncached), cache_creation (writes), cache_read, output (includes reasoning); costs are API
 list-price USD. host_cost is the host subscription; worker_cost is the delegate (agy: Gemini price
@@ -79,9 +79,13 @@ for agents:
     src, out = args.records, args.out
     recs = [json.loads(line) for line in src.read_text().splitlines() if line.strip()]
     latest = {}
+    pending = []
     for r in sorted(recs, key=lambda r: r["job"]):
         k = run_key(r)
         if not k or r["infra_flags"]:
+            continue
+        if r["resolved"] is None:
+            pending.append(r["job"])
             continue
         latest[(r["agy_staff_version"], k, r["dataset"], r["setup"], r["instance_id"], r["rep"])] = r
 
@@ -134,6 +138,8 @@ for agents:
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(doc, indent=1) + "\n")
+    if pending:
+        print("skipped pending grading: " + ", ".join(pending), file=sys.stderr)
     print(f"wrote {len(trials)} trials, {len(aggregates)} groups to {out}", file=sys.stderr)
 
 

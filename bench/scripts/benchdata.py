@@ -11,6 +11,14 @@ import sys
 from pathlib import Path
 
 CONFIG_OPTIONS = ("--data", "--proxy", "--expect-egress", "--agy-auth-dir", "--claude-token", "--codex-auth")
+OFFLINE_JUDGES = ("gemini-3.8-flash", "deepseek-v4-pro")
+OFFLINE_REPEATS = 3
+OFFLINE_VOTE_KEYS = {"swe-atlas-qna": "pass", "deepsearchqa": "fully_correct"}
+
+
+def trial_answer_text(trial):
+    candidates = [trial / "agent" / "answer.txt", trial / "artifacts" / "workspace" / "answer.txt"]
+    return next((p.read_text() for p in candidates if p.is_file()), "")
 
 
 def config_file():
